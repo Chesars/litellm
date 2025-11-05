@@ -248,7 +248,7 @@ class KeyManagementEventHooks:
                         ),
                         description=description,
                         secret_value=secret_token,
-                        tags=tags
+                        tags=tags,
                     )
 
     @staticmethod

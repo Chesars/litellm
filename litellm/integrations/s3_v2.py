@@ -76,7 +76,7 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
                 s3_config=s3_config,
                 s3_path=s3_path,
                 s3_use_team_prefix=s3_use_team_prefix,
-                s3_strip_base64_files=s3_strip_base64_files
+                s3_strip_base64_files=s3_strip_base64_files,
             )
             verbose_logger.debug(f"s3 logger using endpoint url {s3_endpoint_url}")
 
@@ -87,7 +87,7 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
             )
             self.async_httpx_client = get_async_httpx_client(
                 llm_provider=httpxSpecialProvider.LoggingCallback,
-                params={"ssl_verify": self.s3_verify}
+                params={"ssl_verify": self.s3_verify},
             )
 
             asyncio.create_task(self.periodic_flush())
@@ -152,10 +152,14 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
             litellm.s3_callback_params.get("s3_api_version") or s3_api_version
         )
         self.s3_use_ssl = (
-            litellm.s3_callback_params.get("s3_use_ssl", True) if litellm.s3_callback_params.get("s3_use_ssl") is not None else s3_use_ssl
+            litellm.s3_callback_params.get("s3_use_ssl", True)
+            if litellm.s3_callback_params.get("s3_use_ssl") is not None
+            else s3_use_ssl
         )
         self.s3_verify = (
-            litellm.s3_callback_params.get("s3_verify") if litellm.s3_callback_params.get("s3_verify") is not None else s3_verify
+            litellm.s3_callback_params.get("s3_verify")
+            if litellm.s3_callback_params.get("s3_verify") is not None
+            else s3_verify
         )
         self.s3_endpoint_url = (
             litellm.s3_callback_params.get("s3_endpoint_url") or s3_endpoint_url
@@ -286,9 +290,7 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
             verbose_logger.debug(
                 f"s3_v2 logger - uploading data to s3 - {batch_logging_element.s3_object_key}"
             )
-            verbose_logger.debug(
-                f"s3_v2 logger - s3_verify setting: {self.s3_verify}"
-            )
+            verbose_logger.debug(f"s3_v2 logger - s3_verify setting: {self.s3_verify}")
 
             # Prepare the URL
             url = f"https://{self.s3_bucket_name}.s3.{self.s3_region_name}.amazonaws.com/{batch_logging_element.s3_object_key}"
@@ -385,7 +387,10 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
 
         if self.s3_strip_base64_files:
             import asyncio
-            standard_logging_payload = asyncio.run(self._strip_base64_from_messages(standard_logging_payload))
+
+            standard_logging_payload = asyncio.run(
+                self._strip_base64_from_messages(standard_logging_payload)
+            )
 
         team_alias = standard_logging_payload["metadata"].get("user_api_key_team_alias")
 
@@ -489,7 +494,9 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
             signed_headers = dict(aws_request.headers.items())
 
             httpx_client = _get_httpx_client(
-                params={"ssl_verify": self.s3_verify} if self.s3_verify is not None else None
+                params={"ssl_verify": self.s3_verify}
+                if self.s3_verify is not None
+                else None
             )
             # Make the request
             response = httpx_client.put(url, data=json_string, headers=signed_headers)
