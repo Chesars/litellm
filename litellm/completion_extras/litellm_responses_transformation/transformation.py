@@ -541,7 +541,7 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
     ) -> Optional[Reasoning]:
         # If dict is passed, convert it directly to Reasoning object
         if isinstance(reasoning_effort, dict):
-            return Reasoning(**reasoning_effort)
+            return Reasoning(**reasoning_effort)  # type: ignore[typeddict-item]
 
         # If string is passed, map without summary (default)
         if reasoning_effort == "high":
