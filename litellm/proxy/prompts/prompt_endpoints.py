@@ -6,7 +6,15 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 from pydantic import BaseModel
 
 from litellm._logging import verbose_proxy_logger
@@ -20,8 +28,80 @@ from litellm.types.prompts.init_prompts import (
     PromptSpec,
     PromptTemplateBase,
 )
+from litellm.types.proxy.prompt_endpoints import TestPromptRequest
 
 router = APIRouter()
+
+
+def get_base_prompt_id(prompt_id: str) -> str:
+    """
+    Extract the base prompt ID by stripping the version suffix if present.
+    
+    Args:
+        prompt_id: Prompt ID that may include version suffix (e.g., "jack_success.v1")
+    
+    Returns:
+        Base prompt ID without version suffix (e.g., "jack_success")
+    
+    Examples:
+        >>> get_base_prompt_id("jack_success.v1")
+        "jack_success"
+        >>> get_base_prompt_id("jack_success")
+        "jack_success"
+    """
+    return prompt_id.split(".v")[0] if ".v" in prompt_id else prompt_id
+
+
+def get_version_number(prompt_id: str) -> int:
+    """
+    Extract the version number from a versioned prompt ID.
+    
+    Args:
+        prompt_id: Prompt ID that may include version suffix (e.g., "jack_success.v2")
+    
+    Returns:
+        Version number (defaults to 1 if no version suffix or invalid format)
+    
+    Examples:
+        >>> get_version_number("jack_success.v2")
+        2
+        >>> get_version_number("jack_success")
+        1
+    """
+    if ".v" in prompt_id:
+        version_str = prompt_id.split(".v")[1]
+        try:
+            return int(version_str)
+        except ValueError:
+            return 1
+    return 1
+
+
+def get_latest_prompt_versions(prompts: List[PromptSpec]) -> List[PromptSpec]:
+    """
+    Filter a list of prompts to return only the latest version of each unique prompt.
+    
+    Args:
+        prompts: List of PromptSpec objects
+    
+    Returns:
+        List of PromptSpec objects with only the latest version of each prompt
+    """
+    latest_prompts: Dict[str, PromptSpec] = {}
+    
+    for prompt in prompts:
+        base_id = get_base_prompt_id(prompt_id=prompt.prompt_id)
+        version = get_version_number(prompt_id=prompt.prompt_id)
+        
+        # Keep the prompt with the highest version number
+        if base_id not in latest_prompts:
+            latest_prompts[base_id] = prompt
+        else:
+            existing_version = get_version_number(prompt_id=latest_prompts[base_id].prompt_id)
+            if version > existing_version:
+                latest_prompts[base_id] = prompt
+    
+    return list(latest_prompts.values())
 
 
 async def get_next_version_for_prompt(prisma_client, prompt_id: str) -> int:
@@ -162,11 +242,87 @@ async def list_prompts(
         user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN
         or user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value
     ):
-        return ListPromptsResponse(
-            prompts=list(IN_MEMORY_PROMPT_REGISTRY.IN_MEMORY_PROMPTS.values())
-        )
+        # Get all prompts and filter to show only the latest version of each
+        all_prompts = list(IN_MEMORY_PROMPT_REGISTRY.IN_MEMORY_PROMPTS.values())
+        latest_prompts = get_latest_prompt_versions(prompts=all_prompts)
+        return ListPromptsResponse(prompts=latest_prompts)
     else:
         return ListPromptsResponse(prompts=[])
+
+
+@router.get(
+    "/prompts/{prompt_id}/versions",
+    tags=["Prompt Management"],
+    dependencies=[Depends(user_api_key_auth)],
+    response_model=ListPromptsResponse,
+)
+async def get_prompt_versions(
+    prompt_id: str,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    """
+    Get all versions of a specific prompt by base prompt ID
+    
+    👉 [Prompt docs](https://docs.litellm.ai/docs/proxy/prompt_management)
+    
+    Example Request:
+    ```bash
+    curl -X GET "http://localhost:4000/prompts/jack_success/versions" \\
+        -H "Authorization: Bearer <your_api_key>"
+    ```
+    
+    Example Response:
+    ```json
+    {
+        "prompts": [
+            {
+                "prompt_id": "jack_success.v1",
+                "litellm_params": {...},
+                "prompt_info": {"prompt_type": "db"},
+                "created_at": "2023-11-09T12:34:56.789Z",
+                "updated_at": "2023-11-09T12:34:56.789Z"
+            },
+            {
+                "prompt_id": "jack_success.v2",
+                "litellm_params": {...},
+                "prompt_info": {"prompt_type": "db"},
+                "created_at": "2023-11-09T13:45:12.345Z",
+                "updated_at": "2023-11-09T13:45:12.345Z"
+            }
+        ]
+    }
+    ```
+    """
+    from litellm.proxy.prompts.prompt_registry import IN_MEMORY_PROMPT_REGISTRY
+
+    # Only allow proxy admins to view version history
+    if user_api_key_dict.user_role is None or (
+        user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN
+        and user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN.value
+    ):
+        raise HTTPException(
+            status_code=403, detail="Only proxy admins can view prompt versions"
+        )
+    
+    # Strip version suffix if provided (e.g., "jack_success.v1" -> "jack_success")
+    base_prompt_id = get_base_prompt_id(prompt_id=prompt_id)
+    
+    # Get all prompts and filter by base_prompt_id
+    all_prompts = list(IN_MEMORY_PROMPT_REGISTRY.IN_MEMORY_PROMPTS.values())
+    prompt_versions = [
+        prompt for prompt in all_prompts
+        if get_base_prompt_id(prompt_id=prompt.prompt_id) == base_prompt_id
+    ]
+    
+    if not prompt_versions:
+        raise HTTPException(
+            status_code=404, detail=f"No versions found for prompt ID {base_prompt_id}"
+        )
+    
+    # Sort by version number (descending - newest first)
+    prompt_versions.sort(key=lambda p: get_version_number(prompt_id=p.prompt_id), reverse=True)
+    
+    return ListPromptsResponse(prompts=prompt_versions)
 
 
 @router.get(
@@ -418,19 +574,21 @@ async def update_prompt(
         )
 
     try:
+        # Strip version suffix from prompt_id if present (e.g., "jack_success.v1" -> "jack_success")
+        base_prompt_id = get_base_prompt_id(prompt_id=prompt_id)
+        
         # Check if any version exists
         existing_prompts = await prisma_client.db.litellm_prompttable.find_many(
-            where={"prompt_id": request.prompt_id}
+            where={"prompt_id": base_prompt_id}
         )
         
         if not existing_prompts:
             raise HTTPException(
-                status_code=404, detail=f"Prompt with ID {request.prompt_id} not found"
+                status_code=404, detail=f"Prompt with ID {base_prompt_id} not found"
             )
 
         # Check if it's a config prompt
-        base_prompt_id = request.prompt_id
-        existing_in_memory = IN_MEMORY_PROMPT_REGISTRY.get_prompt_by_id(base_prompt_id)
+        existing_in_memory = IN_MEMORY_PROMPT_REGISTRY.get_prompt_by_id(prompt_id)
         if existing_in_memory and existing_in_memory.prompt_info.prompt_type == "config":
             raise HTTPException(
                 status_code=400,
@@ -439,13 +597,13 @@ async def update_prompt(
 
         # Get next version number (UPDATE creates a new version)
         new_version = await get_next_version_for_prompt(
-            prisma_client=prisma_client, prompt_id=request.prompt_id
+            prisma_client=prisma_client, prompt_id=base_prompt_id
         )
 
         # Store new version in db
         prompt_db_entry = await prisma_client.db.litellm_prompttable.create(
             data={
-                "prompt_id": request.prompt_id,
+                "prompt_id": base_prompt_id,
                 "version": new_version,
                 "litellm_params": request.litellm_params.model_dump_json(),
                 "prompt_info": (
@@ -664,6 +822,154 @@ async def patch_prompt(
         raise e
     except Exception as e:
         verbose_proxy_logger.exception(f"Error patching prompt: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/prompts/test",
+    tags=["Prompt Management"],
+    dependencies=[Depends(user_api_key_auth)],
+)
+async def test_prompt(
+    request: TestPromptRequest,
+    fastapi_request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    """
+    Test a prompt by rendering it with variables and executing an LLM call.
+    
+    This endpoint allows testing prompts before saving them to the database.
+    The response is always streamed.
+    
+    👉 [Prompt docs](https://docs.litellm.ai/docs/proxy/prompt_management)
+    
+    Example Request:
+    ```bash
+    curl -X POST "http://localhost:4000/prompts/test" \\
+        -H "Authorization: Bearer <your_api_key>" \\
+        -H "Content-Type: application/json" \\
+        -d '{
+            "dotprompt_content": "---\\nmodel: gpt-4o\\ntemperature: 0.7\\n---\\n\\nUser: Hello {{name}}",
+            "prompt_variables": {
+                "name": "World"
+            }
+        }'
+    ```
+    """
+    from pydantic import BaseModel
+
+    from litellm.integrations.dotprompt.dotprompt_manager import DotpromptManager
+    from litellm.integrations.dotprompt.prompt_manager import (
+        PromptManager,
+        PromptTemplate,
+    )
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+    from litellm.proxy.proxy_server import (
+        general_settings,
+        llm_router,
+        proxy_config,
+        proxy_logging_obj,
+        select_data_generator,
+        user_api_base,
+        user_max_tokens,
+        user_model,
+        user_request_timeout,
+        user_temperature,
+        version,
+    )
+    
+    try:
+        # Parse the dotprompt content and create PromptTemplate
+        prompt_manager = PromptManager()
+        frontmatter, template_content = prompt_manager._parse_frontmatter(
+            content=request.dotprompt_content
+        )
+        
+        # Create PromptTemplate to leverage existing parameter extraction logic
+        template = PromptTemplate(
+            content=template_content,
+            metadata=frontmatter,
+            template_id="test_prompt"
+        )
+        
+        # Extract model from template
+        if not template.model:
+            raise HTTPException(
+                status_code=400,
+                detail="Model is required in dotprompt metadata"
+            )
+        
+        # Always render the template to extract system messages and other metadata
+        variables = request.prompt_variables or {}
+        rendered_content = prompt_manager.jinja_env.from_string(
+            template_content
+        ).render(**variables)
+        
+        # Convert rendered content to messages using DotpromptManager's method
+        dotprompt_manager = DotpromptManager()
+        rendered_messages = dotprompt_manager._convert_to_messages(
+            rendered_content=rendered_content
+        )
+        
+        if not rendered_messages:
+            raise HTTPException(
+                status_code=400,
+                detail="No messages found in rendered prompt"
+            )
+        
+        # If conversation history is provided, use it but preserve system messages
+        if request.conversation_history:
+            # Extract system messages from rendered prompt
+            system_messages = [msg for msg in rendered_messages if msg.get("role") == "system"]
+            # Use conversation history for user/assistant messages
+            messages = system_messages + request.conversation_history
+        else:
+            messages = rendered_messages
+        
+        # Use PromptTemplate's optional_params which already extracts all parameters
+        optional_params = template.optional_params.copy()
+        
+        # Always stream the response
+        optional_params["stream"] = True
+        
+        # Build request data for chat completion
+        data = {
+            "model": template.model,
+            "messages": messages,
+        }
+        data.update(optional_params)
+        
+        # Use ProxyBaseLLMRequestProcessing to go through all proxy logic
+        base_llm_response_processor = ProxyBaseLLMRequestProcessing(data=data)
+        result = await base_llm_response_processor.base_process_llm_request(
+            request=fastapi_request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            route_type="acompletion",
+            proxy_logging_obj=proxy_logging_obj,
+            llm_router=llm_router,
+            general_settings=general_settings,
+            proxy_config=proxy_config,
+            select_data_generator=select_data_generator,
+            model=None,
+            user_model=user_model,
+            user_temperature=user_temperature,
+            user_request_timeout=user_request_timeout,
+            user_max_tokens=user_max_tokens,
+            user_api_base=user_api_base,
+            version=version,
+        )
+        
+        if isinstance(result, BaseModel):
+            return result.model_dump(exclude_none=True, exclude_unset=True)
+        else:
+            return result
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        verbose_proxy_logger.exception(f"Error testing prompt: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
