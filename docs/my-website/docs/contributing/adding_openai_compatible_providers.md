@@ -1,11 +1,11 @@
 # Adding OpenAI-Compatible Providers
 
-For simple OpenAI-compatible providers (like Hyperbolic, Nscale, etc.), you can add support by editing a single JSON file.
+For simple OpenAI-compatible providers (like Hyperbolic, Nscale, etc.), you can add support by editing two JSON files.
 
 ## Quick Start
 
-1. Edit `litellm/llms/openai_like/providers.json`
-2. Add your provider configuration
+1. Edit `litellm/llms/openai_like/providers.json` - Add your provider configuration
+2. Edit `provider_endpoints_support.json` - Register your provider endpoints
 3. Test with: `litellm.completion(model="your_provider/model-name", ...)`
 
 ## Basic Configuration
